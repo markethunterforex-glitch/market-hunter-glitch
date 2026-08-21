@@ -1,161 +1,77 @@
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
+from collections import defaultdict, deque
 import os
 import math
 
 app = Flask(__name__)
 
-# ============================================================
-# XAU AI TRADING COPILOT
-# SMC + ICT + MSNR + S/R + LIQUIDITY SWEEP
-# MARKET STRUCTURE + PRICE ACTION ENGINE
-# Version 2.0
-# ============================================================
+VERSION = "FINAL-4.0"
+MAX_CANDLES = 500
+history = defaultdict(lambda: deque(maxlen=MAX_CANDLES))
 
 
 # ============================================================
-# BASIC HELPERS
+# HELPERS
 # ============================================================
 
-def safe_float(value, default=0.0):
+def f(v, default=0.0):
     try:
-        return float(value)
-    except:
+        return float(v)
+    except (TypeError, ValueError):
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def clamp(v, lo=0, hi=100):
+    return max(lo, min(hi, v))
 
 
-def avg(values):
-    values = [v for v in values if isinstance(v, (int, float))]
+def bull(c): return f(c["close"]) > f(c["open"])
+def bear(c): return f(c["close"]) < f(c["open"])
+
+
+def body(c):
+    return abs(f(c["close"]) - f(c["open"]))
+
+
+def low_wick(c):
+    return max(0, min(f(c["open"]), f(c["close"])) - f(c["low"]))
+
+
+def high_wick(c):
+    return max(0, f(c["high"]) - max(f(c["open"]), f(c["close"])))
+
+
+def atr(cs, period=14):
+    if len(cs) < 2:
+        return 0
+    trs = []
+    start = max(1, len(cs) - period)
+    for i in range(start, len(cs)):
+        h, l = f(cs[i]["high"]), f(cs[i]["low"])
+        pc = f(cs[i-1]["close"])
+        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+    return sum(trs) / len(trs) if trs else 0
+
+
+def ema(values, period):
     if not values:
-        return 0.0
-    return sum(values) / len(values)
+        return 0
+    k = 2 / (period + 1)
+    e = values[0]
+    for x in values[1:]:
+        e = x*k + e*(1-k)
+    return e
 
 
-def candle_range(c):
-    return max(0.0, c["high"] - c["low"])
-
-
-def body_size(c):
-    return abs(c["close"] - c["open"])
-
-
-def is_bullish(c):
-    return c["close"] > c["open"]
-
-
-def is_bearish(c):
-    return c["close"] < c["open"]
-
-
-# ============================================================
-# NORMALIZE CANDLE DATA
-# ============================================================
-
-def normalize_candles(raw):
-    candles = []
-
-    if not isinstance(raw, list):
-        return candles
-
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-
-        try:
-            c = {
-                "time": item.get("time", ""),
-                "open": safe_float(item.get("open")),
-                "high": safe_float(item.get("high")),
-                "low": safe_float(item.get("low")),
-                "close": safe_float(item.get("close")),
-                "volume": safe_float(item.get("volume", 0))
-            }
-
-            if c["high"] <= 0 or c["low"] <= 0:
-                continue
-
-            if c["high"] < c["low"]:
-                continue
-
-            candles.append(c)
-
-        except:
-            continue
-
-    return candles
-
-
-# ============================================================
-# PRICE ACTION
-# ============================================================
-
-def price_action(candles):
-    if len(candles) < 3:
-        return {
-            "bullish": False,
-            "bearish": False,
-            "pattern": "insufficient_data"
-        }
-
-    c = candles[-1]
-    p = candles[-2]
-
-    rng = candle_range(c)
-
-    if rng <= 0:
-        return {
-            "bullish": False,
-            "bearish": False,
-            "pattern": "neutral"
-        }
-
-    body = body_size(c)
-
-    upper_wick = c["high"] - max(c["open"], c["close"])
-    lower_wick = min(c["open"], c["close"]) - c["low"]
-
-    bullish = False
-    bearish = False
-    pattern = "normal"
-
-    # Bullish engulfing
-    if (
-        is_bullish(c)
-        and is_bearish(p)
-        and c["close"] > p["open"]
-        and c["open"] < p["close"]
-    ):
-        bullish = True
-        pattern = "bullish_engulfing"
-
-    # Bearish engulfing
-    elif (
-        is_bearish(c)
-        and is_bullish(p)
-        and c["open"] > p["close"]
-        and c["close"] < p["open"]
-    ):
-        bearish = True
-        pattern = "bearish_engulfing"
-
-    # Bullish rejection
-    elif lower_wick > body * 1.5 and c["close"] > c["open"]:
-        bullish = True
-        pattern = "bullish_rejection"
-
-    # Bearish rejection
-    elif upper_wick > body * 1.5 and c["close"] < c["open"]:
-        bearish = True
-        pattern = "bearish_rejection"
-
+def normalize(c):
     return {
-        "bullish": bullish,
-        "bearish": bearish,
-        "pattern": pattern
+        "time": c.get("time", ""),
+        "open": f(c.get("open")),
+        "high": f(c.get("high")),
+        "low": f(c.get("low")),
+        "close": f(c.get("close")),
+        "volume": f(c.get("volume"), 0),
     }
 
 
@@ -163,77 +79,145 @@ def price_action(candles):
 # MARKET STRUCTURE
 # ============================================================
 
-def market_structure(candles, lookback=20):
-    if len(candles) < 8:
+def pivot_high(cs, i, s=2):
+    if i < s or i+s >= len(cs):
+        return False
+    h = f(cs[i]["high"])
+    return all(j == i or f(cs[j]["high"]) < h
+               for j in range(i-s, i+s+1))
+
+
+def pivot_low(cs, i, s=2):
+    if i < s or i+s >= len(cs):
+        return False
+    l = f(cs[i]["low"])
+    return all(j == i or f(cs[j]["low"]) > l
+               for j in range(i-s, i+s+1))
+
+
+def swings(cs):
+    highs, lows = [], []
+    for i in range(len(cs)):
+        if pivot_high(cs, i):
+            highs.append((i, f(cs[i]["high"])))
+        if pivot_low(cs, i):
+            lows.append((i, f(cs[i]["low"])))
+    return highs, lows
+
+
+def structure_engine(cs):
+    ph, pl = swings(cs)
+
+    if len(ph) < 2 or len(pl) < 2:
         return {
             "trend": "neutral",
-            "bos": "none",
-            "choch": "none",
-            "structure": "insufficient_data"
+            "structure": "insufficient",
+            "bos": None,
+            "choch": None,
+            "swing_high": None,
+            "swing_low": None,
         }
 
-    data = candles[-lookback:] if len(candles) > lookback else candles
+    h1, h2 = ph[-2][1], ph[-1][1]
+    l1, l2 = pl[-2][1], pl[-1][1]
+    close = f(cs[-1]["close"])
 
-    highs = [c["high"] for c in data]
-    lows = [c["low"] for c in data]
+    if h2 > h1 and l2 > l1:
+        trend, structure = "bullish", "HH_HL"
+    elif h2 < h1 and l2 < l1:
+        trend, structure = "bearish", "LH_LL"
+    else:
+        trend, structure = "range", "mixed"
 
-    recent_high = max(highs[:-2])
-    recent_low = min(lows[:-2])
+    bos = None
+    choch = None
 
-    last = data[-1]
-    previous = data[-2]
+    if close > h2:
+        bos = "bullish_BOS"
+    elif close < l2:
+        bos = "bearish_BOS"
 
-    trend = "neutral"
-    bos = "none"
-    choch = "none"
-
-    # Basic directional structure
-    if data[-1]["close"] > data[0]["close"]:
-        trend = "bullish"
-    elif data[-1]["close"] < data[0]["close"]:
-        trend = "bearish"
-
-    # Break of structure
-    if last["close"] > recent_high:
-        bos = "bullish"
-
-    elif last["close"] < recent_low:
-        bos = "bearish"
-
-    # Reversal / CHoCH approximation
-    if trend == "bearish" and last["close"] > previous["high"]:
-        choch = "bullish"
-
-    elif trend == "bullish" and last["close"] < previous["low"]:
-        choch = "bearish"
+    if trend == "bearish" and close > h2:
+        choch = "bullish_CHoCH"
+    elif trend == "bullish" and close < l2:
+        choch = "bearish_CHoCH"
 
     return {
         "trend": trend,
+        "structure": structure,
         "bos": bos,
         "choch": choch,
-        "structure": "valid"
+        "swing_high": h2,
+        "swing_low": l2,
     }
 
 
 # ============================================================
-# SUPPORT / RESISTANCE
+# SUPPORT / RESISTANCE + PULLBACK / RETEST
 # ============================================================
 
-def support_resistance(candles, lookback=50):
-    if len(candles) < 5:
-        return {
-            "support": 0,
-            "resistance": 0
-        }
+def sr_engine(cs, lookback=100):
+    data = cs[-lookback:]
+    ph, pl = swings(data)
 
-    data = candles[-lookback:] if len(candles) > lookback else candles
+    price = f(cs[-1]["close"])
 
-    support = min(c["low"] for c in data)
-    resistance = max(c["high"] for c in data)
+    support = max(
+        [v for _, v in pl if v <= price],
+        default=min(f(x["low"]) for x in data)
+    )
+
+    resistance = min(
+        [v for _, v in ph if v >= price],
+        default=max(f(x["high"]) for x in data)
+    )
+
+    av = max(atr(data), price * 0.0003, 1e-9)
+
+    # Break/retest detection:
+    # Bullish: resistance was broken, then current price retested
+    # that old resistance from above and rejected upward.
+    bull_pullback = False
+    bear_pullback = False
+
+    if len(data) >= 8:
+        for i in range(max(3, len(data)-12), len(data)-1):
+            old_res = f(data[i]["high"])
+            later = data[i+1:]
+
+            if any(f(x["close"]) > old_res for x in later[:-1]):
+                c = data[-1]
+                if f(c["low"]) <= old_res + av*0.35 and f(c["close"]) > old_res:
+                    bull_pullback = True
+                    resistance = old_res
+                    break
+
+            old_sup = f(data[i]["low"])
+            if any(f(x["close"]) < old_sup for x in later[:-1]):
+                c = data[-1]
+                if f(c["high"]) >= old_sup - av*0.35 and f(c["close"]) < old_sup:
+                    bear_pullback = True
+                    support = old_sup
+                    break
+
+    near_support = abs(price-support) <= av*0.45
+    near_resistance = abs(price-resistance) <= av*0.45
+
+    bullish_rejection = bull(cs[-1]) and low_wick(cs[-1]) >= body(cs[-1]) * 0.8
+    bearish_rejection = bear(cs[-1]) and high_wick(cs[-1]) >= body(cs[-1]) * 0.8
 
     return {
         "support": support,
-        "resistance": resistance
+        "resistance": resistance,
+        "near_support": near_support,
+        "near_resistance": near_resistance,
+        "bullish_pullback_retest": bull_pullback and bullish_rejection,
+        "bearish_pullback_retest": bear_pullback and bearish_rejection,
+        "pullback_zone": (
+            "bullish_retest" if bull_pullback and bullish_rejection
+            else "bearish_retest" if bear_pullback and bearish_rejection
+            else "none"
+        ),
     }
 
 
@@ -241,639 +225,507 @@ def support_resistance(candles, lookback=50):
 # LIQUIDITY SWEEP
 # ============================================================
 
-def liquidity_sweep(candles, lookback=10):
-    if len(candles) < lookback + 2:
+def liquidity_engine(cs, lookback=20):
+    if len(cs) < lookback + 2:
+        return {"type": "none", "level": None, "strength": 0}
+
+    old = cs[-lookback-1:-1]
+    c = cs[-1]
+
+    old_high = max(f(x["high"]) for x in old)
+    old_low = min(f(x["low"]) for x in old)
+
+    if f(c["low"]) < old_low and f(c["close"]) > old_low:
         return {
-            "sweep": "none",
-            "level": 0
+            "type": "sell_side_sweep",
+            "level": old_low,
+            "strength": int(clamp(65 + low_wick(c)/max(atr(cs),1e-9)*20))
         }
 
-    previous = candles[-lookback-1:-1]
-    current = candles[-1]
-
-    previous_high = max(c["high"] for c in previous)
-    previous_low = min(c["low"] for c in previous)
-
-    # Sell-side liquidity sweep
-    # Price takes previous low and closes back above it
-    if (
-        current["low"] < previous_low
-        and current["close"] > previous_low
-    ):
+    if f(c["high"]) > old_high and f(c["close"]) < old_high:
         return {
-            "sweep": "sell_side_sweep",
-            "level": previous_low
+            "type": "buy_side_sweep",
+            "level": old_high,
+            "strength": int(clamp(65 + high_wick(c)/max(atr(cs),1e-9)*20))
         }
 
-    # Buy-side liquidity sweep
-    # Price takes previous high and closes back below it
-    if (
-        current["high"] > previous_high
-        and current["close"] < previous_high
-    ):
-        return {
-            "sweep": "buy_side_sweep",
-            "level": previous_high
-        }
-
-    return {
-        "sweep": "none",
-        "level": 0
-    }
+    return {"type": "none", "level": None, "strength": 0}
 
 
 # ============================================================
-# FAIR VALUE GAP
+# ICT / SMC
 # ============================================================
 
-def detect_fvg(candles):
-    if len(candles) < 3:
+def fvg_engine(cs):
+    if len(cs) < 3:
+        return {"type": "none"}
+
+    a, c = cs[-3], cs[-1]
+
+    if f(c["low"]) > f(a["high"]):
         return {
-            "bullish": False,
-            "bearish": False,
-            "type": "none"
+            "type": "bullish_FVG",
+            "low": f(a["high"]),
+            "high": f(c["low"])
         }
 
-    a = candles[-3]
-    b = candles[-2]
-    c = candles[-1]
-
-    # Bullish FVG
-    if c["low"] > a["high"]:
+    if f(c["high"]) < f(a["low"]):
         return {
-            "bullish": True,
-            "bearish": False,
-            "type": "bullish_fvg",
-            "low": a["high"],
-            "high": c["low"]
+            "type": "bearish_FVG",
+            "low": f(c["high"]),
+            "high": f(a["low"])
         }
 
-    # Bearish FVG
-    if c["high"] < a["low"]:
-        return {
-            "bullish": False,
-            "bearish": True,
-            "type": "bearish_fvg",
-            "low": c["high"],
-            "high": a["low"]
-        }
-
-    return {
-        "bullish": False,
-        "bearish": False,
-        "type": "none"
-    }
+    return {"type": "none"}
 
 
-# ============================================================
-# ORDER BLOCK
-# ============================================================
+def order_block_engine(cs):
+    if len(cs) < 5:
+        return {"type": "none"}
 
-def detect_order_block(candles):
-    if len(candles) < 5:
-        return {
-            "type": "none"
-        }
+    for i in range(len(cs)-2, max(-1, len(cs)-10), -1):
+        c, n = cs[i], cs[i+1]
 
-    last = candles[-1]
-    previous = candles[-2]
-
-    # Bullish OB approximation:
-    # Previous bearish candle followed by strong bullish move
-    if is_bearish(previous) and is_bullish(last):
-        if last["close"] > previous["high"]:
+        if bear(c) and bull(n) and f(n["close"]) > f(c["high"]):
             return {
-                "type": "bullish_ob",
-                "high": previous["high"],
-                "low": previous["low"]
+                "type": "bullish_OB",
+                "low": f(c["low"]),
+                "high": f(c["high"])
             }
 
-    # Bearish OB approximation:
-    # Previous bullish candle followed by strong bearish move
-    if is_bullish(previous) and is_bearish(last):
-        if last["close"] < previous["low"]:
+        if bull(c) and bear(n) and f(n["close"]) < f(c["low"]):
             return {
-                "type": "bearish_ob",
-                "high": previous["high"],
-                "low": previous["low"]
+                "type": "bearish_OB",
+                "low": f(c["low"]),
+                "high": f(c["high"])
             }
 
+    return {"type": "none"}
+
+
+def premium_discount(cs):
+    data = cs[-50:]
+    hi = max(f(x["high"]) for x in data)
+    lo = min(f(x["low"]) for x in data)
+    eq = (hi + lo) / 2
+    price = f(cs[-1]["close"])
+
     return {
-        "type": "none"
+        "high": hi,
+        "low": lo,
+        "equilibrium": eq,
+        "zone": "premium" if price > eq else "discount" if price < eq else "equilibrium"
     }
 
 
 # ============================================================
-# PREMIUM / DISCOUNT
+# PRICE ACTION + TREND
 # ============================================================
 
-def premium_discount(candles, lookback=50):
-    if not candles:
-        return {
-            "zone": "unknown",
-            "equilibrium": 0,
-            "high": 0,
-            "low": 0
-        }
+def price_action(cs):
+    c, p = cs[-1], cs[-2]
 
-    data = candles[-lookback:] if len(candles) > lookback else candles
+    if bull(c) and low_wick(c) > body(c) * 1.2:
+        return {"bias": "bullish", "pattern": "bullish_rejection"}
+    if bear(c) and high_wick(c) > body(c) * 1.2:
+        return {"bias": "bearish", "pattern": "bearish_rejection"}
+    if bull(c) and f(c["close"]) > f(p["high"]):
+        return {"bias": "bullish", "pattern": "bullish_displacement"}
+    if bear(c) and f(c["close"]) < f(p["low"]):
+        return {"bias": "bearish", "pattern": "bearish_displacement"}
 
-    high = max(c["high"] for c in data)
-    low = min(c["low"] for c in data)
+    return {"bias": "bullish" if bull(c) else "bearish" if bear(c) else "neutral",
+            "pattern": "normal"}
 
-    equilibrium = (high + low) / 2
-    price = candles[-1]["close"]
 
-    if price < equilibrium:
-        zone = "discount"
-    elif price > equilibrium:
-        zone = "premium"
-    else:
-        zone = "equilibrium"
+def trend_engine(cs):
+    values = [f(x["close"]) for x in cs[-60:]]
+    if len(values) < 25:
+        return {"trend": "neutral", "ema9": None, "ema21": None}
+
+    e9 = ema(values, 9)
+    e21 = ema(values, 21)
 
     return {
-        "zone": zone,
-        "equilibrium": equilibrium,
-        "high": high,
-        "low": low
+        "trend": "bullish" if e9 > e21 else "bearish" if e9 < e21 else "neutral",
+        "ema9": e9,
+        "ema21": e21
     }
 
 
 # ============================================================
-# ATR
+# NEWS FILTER
+#
+# TradingView should send:
+# {
+#   "news": {
+#       "status": "SAFE" | "CAUTION" | "BLOCKED",
+#       "minutes_to_event": 45,
+#       "impact": "high",
+#       "currency": "USD",
+#       "event": "CPI"
+#   }
+# }
+#
+# The bot never invents live news. If no news object is supplied,
+# status is UNKNOWN and the signal is not automatically blocked.
 # ============================================================
 
-def calculate_atr(candles, period=14):
-    if len(candles) < 2:
-        return 0
+def news_engine(data):
+    news = data.get("news")
 
-    trs = []
-
-    start = max(1, len(candles) - period)
-
-    for i in range(start, len(candles)):
-        current = candles[i]
-        previous = candles[i - 1]
-
-        tr = max(
-            current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"])
-        )
-
-        trs.append(tr)
-
-    return avg(trs)
-
-
-# ============================================================
-# TREND STRENGTH
-# ============================================================
-
-def trend_strength(candles):
-    if len(candles) < 10:
+    if not isinstance(news, dict):
         return {
-            "trend": "neutral",
-            "strength": 0
+            "status": "UNKNOWN",
+            "trade_allowed": True,
+            "reason": "No news calendar data supplied"
         }
 
-    closes = [c["close"] for c in candles[-10:]]
+    status = str(news.get("status", "UNKNOWN")).upper()
+    impact = str(news.get("impact", "")).lower()
+    minutes = f(news.get("minutes_to_event"), 999999)
 
-    first = closes[0]
-    last = closes[-1]
-
-    if first == 0:
+    # Hard block around high-impact USD news.
+    if status == "BLOCKED":
         return {
-            "trend": "neutral",
-            "strength": 0
+            "status": "BLOCKED",
+            "trade_allowed": False,
+            "reason": news.get("event", "High-impact news")
         }
 
-    move = ((last - first) / first) * 100
+    if impact == "high" and minutes <= 30:
+        return {
+            "status": "BLOCKED",
+            "trade_allowed": False,
+            "reason": news.get("event", "High-impact USD news within 30 minutes")
+        }
 
-    if move > 0.10:
-        trend = "bullish"
-    elif move < -0.10:
-        trend = "bearish"
-    else:
-        trend = "neutral"
-
-    strength = clamp(abs(move) * 100, 0, 100)
+    if status == "CAUTION" or (impact == "high" and minutes <= 60):
+        return {
+            "status": "CAUTION",
+            "trade_allowed": True,
+            "reason": news.get("event", "High-impact news approaching")
+        }
 
     return {
-        "trend": trend,
-        "strength": round(strength, 2)
+        "status": "SAFE",
+        "trade_allowed": True,
+        "reason": news.get("event", "No immediate high-impact news")
     }
 
 
 # ============================================================
-# MAIN ANALYSIS ENGINE
+# FINAL CONFLUENCE ENGINE
 # ============================================================
 
-def analyse_market(symbol, price, timeframe, data):
-    candles = normalize_candles(data.get("candles", []))
-
-    # --------------------------------------------------------
-    # BACKWARD COMPATIBILITY
-    # --------------------------------------------------------
-
-    if len(candles) < 5:
+def analyse(symbol, timeframe, cs, payload):
+    if len(cs) < 20:
         return {
             "signal": "WAIT",
             "confidence": 0,
-            "reason": "Waiting for sufficient OHLC candle data",
-            "required": "Send at least 20 candles from TradingView",
-            "symbol": symbol,
-            "timeframe": timeframe
+            "status": "collecting_data",
+            "reason": f"Need at least 20 candles ({len(cs)}/20)"
         }
 
-    price = price if price > 0 else candles[-1]["close"]
+    ms = structure_engine(cs)
+    sr = sr_engine(cs)
+    liq = liquidity_engine(cs)
+    pa = price_action(cs)
+    tr = trend_engine(cs)
+    fvg = fvg_engine(cs)
+    ob = order_block_engine(cs)
+    pd = premium_discount(cs)
+    news = news_engine(payload)
 
-    # --------------------------------------------------------
-    # ANALYSE COMPONENTS
-    # --------------------------------------------------------
-
-    structure = market_structure(candles)
-    sr = support_resistance(candles)
-    sweep = liquidity_sweep(candles)
-    fvg = detect_fvg(candles)
-    ob = detect_order_block(candles)
-    pd = premium_discount(candles)
-    pa = price_action(candles)
-    atr = calculate_atr(candles)
-    trend = trend_strength(candles)
-
-    # --------------------------------------------------------
-    # SCORING
-    # --------------------------------------------------------
-
-    buy_score = 0
-    sell_score = 0
-
+    buy = 0
+    sell = 0
     buy_reasons = []
     sell_reasons = []
 
-    # ============================
-    # TREND
-    # ============================
+    # Market structure
+    if ms["trend"] == "bullish":
+        buy += 20
+        buy_reasons.append("bullish structure")
+    elif ms["trend"] == "bearish":
+        sell += 20
+        sell_reasons.append("bearish structure")
 
-    if structure["trend"] == "bullish":
-        buy_score += 15
-        buy_reasons.append("bullish market structure")
-
-    elif structure["trend"] == "bearish":
-        sell_score += 15
-        sell_reasons.append("bearish market structure")
-
-    # ============================
-    # BOS
-    # ============================
-
-    if structure["bos"] == "bullish":
-        buy_score += 15
-        buy_reasons.append("bullish BOS")
-
-    elif structure["bos"] == "bearish":
-        sell_score += 15
-        sell_reasons.append("bearish BOS")
-
-    # ============================
-    # CHOCH
-    # ============================
-
-    if structure["choch"] == "bullish":
-        buy_score += 15
-        buy_reasons.append("bullish CHoCH")
-
-    elif structure["choch"] == "bearish":
-        sell_score += 15
-        sell_reasons.append("bearish CHoCH")
-
-    # ============================
-    # LIQUIDITY
-    # ============================
-
-    if sweep["sweep"] == "sell_side_sweep":
-        buy_score += 25
+    # Liquidity
+    if liq["type"] == "sell_side_sweep":
+        buy += 30
         buy_reasons.append("sell-side liquidity sweep")
-
-    elif sweep["sweep"] == "buy_side_sweep":
-        sell_score += 25
+    elif liq["type"] == "buy_side_sweep":
+        sell += 30
         sell_reasons.append("buy-side liquidity sweep")
 
-    # ============================
-    # PRICE ACTION
-    # ============================
+    # S/R pullback / retest
+    if sr["bullish_pullback_retest"]:
+        buy += 25
+        buy_reasons.append("S/R bullish pullback + rejection")
 
-    if pa["bullish"]:
-        buy_score += 10
+    if sr["bearish_pullback_retest"]:
+        sell += 25
+        sell_reasons.append("S/R bearish pullback + rejection")
+
+    # Price action
+    if pa["bias"] == "bullish":
+        buy += 10
         buy_reasons.append(pa["pattern"])
-
-    elif pa["bearish"]:
-        sell_score += 10
+    elif pa["bias"] == "bearish":
+        sell += 10
         sell_reasons.append(pa["pattern"])
 
-    # ============================
-    # FVG
-    # ============================
+    # BOS / CHoCH
+    if ms["bos"] == "bullish_BOS":
+        buy += 15
+        buy_reasons.append("bullish BOS")
+    elif ms["bos"] == "bearish_BOS":
+        sell += 15
+        sell_reasons.append("bearish BOS")
 
-    if fvg.get("bullish"):
-        buy_score += 8
+    if ms["choch"] == "bullish_CHoCH":
+        buy += 15
+        buy_reasons.append("bullish CHoCH")
+    elif ms["choch"] == "bearish_CHoCH":
+        sell += 15
+        sell_reasons.append("bearish CHoCH")
+
+    # Trend
+    if tr["trend"] == "bullish":
+        buy += 8
+        buy_reasons.append("EMA trend bullish")
+    elif tr["trend"] == "bearish":
+        sell += 8
+        sell_reasons.append("EMA trend bearish")
+
+    # ICT context
+    if pd["zone"] == "discount":
+        buy += 5
+        buy_reasons.append("discount")
+    elif pd["zone"] == "premium":
+        sell += 5
+        sell_reasons.append("premium")
+
+    if fvg["type"] == "bullish_FVG":
+        buy += 4
         buy_reasons.append("bullish FVG")
-
-    elif fvg.get("bearish"):
-        sell_score += 8
+    elif fvg["type"] == "bearish_FVG":
+        sell += 4
         sell_reasons.append("bearish FVG")
 
-    # ============================
-    # ORDER BLOCK
-    # ============================
-
-    if ob.get("type") == "bullish_ob":
-        buy_score += 8
-        buy_reasons.append("bullish order block")
-
-    elif ob.get("type") == "bearish_ob":
-        sell_score += 8
-        sell_reasons.append("bearish order block")
-
-    # ============================
-    # PREMIUM / DISCOUNT
-    # ============================
-
-    if pd["zone"] == "discount":
-        buy_score += 7
-        buy_reasons.append("discount zone")
-
-    elif pd["zone"] == "premium":
-        sell_score += 7
-        sell_reasons.append("premium zone")
-
-    # ============================
-    # SUPPORT / RESISTANCE
-    # ============================
-
-    support = sr["support"]
-    resistance = sr["resistance"]
-
-    if support > 0 and price <= support + atr * 0.25:
-        buy_score += 7
-        buy_reasons.append("near support")
-
-    if resistance > 0 and price >= resistance - atr * 0.25:
-        sell_score += 7
-        sell_reasons.append("near resistance")
-
-    # ========================================================
-    # FINAL DECISION
-    # ========================================================
+    if ob["type"] == "bullish_OB":
+        buy += 4
+        buy_reasons.append("bullish OB")
+    elif ob["type"] == "bearish_OB":
+        sell += 4
+        sell_reasons.append("bearish OB")
 
     signal = "WAIT"
-    confidence = 0
-    reason = "No valid A+ confluence setup"
+    score = max(buy, sell)
+    reasons = buy_reasons if buy >= sell else sell_reasons
 
-    # Strong BUY
-    if (
-        buy_score >= 60
-        and buy_score > sell_score + 10
-        and (
-            sweep["sweep"] == "sell_side_sweep"
-            or structure["bos"] == "bullish"
-            or structure["choch"] == "bullish"
-        )
-    ):
+    # A+ minimum:
+    # liquidity + price action + directional confluence.
+    if buy >= 75 and buy > sell + 10:
         signal = "BUY"
-        confidence = clamp(buy_score, 0, 100)
-
-        reason = (
-            "A+ BUY: "
-            + " + ".join(buy_reasons)
-        )
-
-    # Strong SELL
-    elif (
-        sell_score >= 60
-        and sell_score > buy_score + 10
-        and (
-            sweep["sweep"] == "buy_side_sweep"
-            or structure["bos"] == "bearish"
-            or structure["choch"] == "bearish"
-        )
-    ):
+        reasons = buy_reasons
+    elif sell >= 75 and sell > buy + 10:
         signal = "SELL"
-        confidence = clamp(sell_score, 0, 100)
+        reasons = sell_reasons
 
-        reason = (
-            "A+ SELL: "
-            + " + ".join(sell_reasons)
-        )
+    # News block overrides technical signal.
+    if not news["trade_allowed"]:
+        signal = "WAIT"
+        score = min(score, 69)
+        reasons = [f"NEWS BLOCK: {news['reason']}"]
 
-    # ========================================================
-    # RISK LEVELS
-    # ========================================================
+    # Unknown news is allowed but clearly reported.
+    confidence = int(clamp(score))
 
-    entry = price
-
-    if atr <= 0:
-        atr = candle_range(candles[-1])
-
-    if signal == "BUY":
-
-        sl = entry - (atr * 1.2)
-        risk = entry - sl
-
-        tp1 = entry + risk * 1.5
-        tp2 = entry + risk * 2.0
-        tp3 = entry + risk * 3.0
-
-    elif signal == "SELL":
-
-        sl = entry + (atr * 1.2)
-        risk = sl - entry
-
-        tp1 = entry - risk * 1.5
-        tp2 = entry - risk * 2.0
-        tp3 = entry - risk * 3.0
-
-    else:
-
-        sl = 0
-        tp1 = 0
-        tp2 = 0
-        tp3 = 0
-
-    # ========================================================
-    # RESULT
-    # ========================================================
+    plan = trade_plan(cs, signal, liq, sr)
 
     return {
         "signal": signal,
-        "confidence": round(confidence, 2),
-        "reason": reason,
-
+        "confidence": confidence,
+        "reason": " + ".join(reasons) if reasons else "No A+ confluence",
         "symbol": symbol,
         "timeframe": timeframe,
-        "price": price,
-
-        "entry": round(entry, 5),
-        "stop_loss": round(sl, 5),
-        "tp1": round(tp1, 5),
-        "tp2": round(tp2, 5),
-        "tp3": round(tp3, 5),
-
-        "buy_score": buy_score,
-        "sell_score": sell_score,
-
-        "market_structure": structure,
-        "trend": trend,
-
-        "liquidity": sweep,
+        "price": f(cs[-1]["close"]),
+        "market_structure": ms,
         "support_resistance": sr,
-
+        "liquidity": liq,
+        "price_action": pa,
+        "trend": tr,
+        "premium_discount": pd,
         "fvg": fvg,
         "order_block": ob,
+        "news_filter": news,
+        "trade_plan": plan,
+        "candle_count": len(cs),
+        "generated_at": datetime.now(timezone.utc).isoformat()
+    }
 
-        "premium_discount": pd,
-        "price_action": pa,
 
-        "atr": round(atr, 5),
+def trade_plan(cs, signal, liq, sr):
+    price = f(cs[-1]["close"])
+    av = max(atr(cs), price * 0.0005, 1e-9)
 
-        "timestamp": datetime.utcnow().isoformat()
+    if signal == "BUY":
+        ref = liq.get("level") or sr.get("support") or f(cs[-1]["low"])
+        sl = min(f(cs[-1]["low"]), f(ref)) - av * 0.15
+        risk = max(price - sl, av * 0.60)
+        return {
+            "entry": price,
+            "sl": price - risk,
+            "tp1": price + risk * 1.5,
+            "tp2": price + risk * 2,
+            "tp3": price + risk * 3,
+            "rr": [1.5, 2, 3]
+        }
+
+    if signal == "SELL":
+        ref = liq.get("level") or sr.get("resistance") or f(cs[-1]["high"])
+        sl = max(f(cs[-1]["high"]), f(ref)) + av * 0.15
+        risk = max(sl - price, av * 0.60)
+        return {
+            "entry": price,
+            "sl": price + risk,
+            "tp1": price - risk * 1.5,
+            "tp2": price - risk * 2,
+            "tp3": price - risk * 3,
+            "rr": [1.5, 2, 3]
+        }
+
+    return {
+        "entry": price,
+        "sl": None,
+        "tp1": None,
+        "tp2": None,
+        "tp3": None,
+        "rr": []
     }
 
 
 # ============================================================
-# HOME
+# WEBHOOK DATA
 # ============================================================
 
-@app.route("/", methods=["GET"])
-def home():
+def add_candle(symbol, timeframe, candle):
+    key = f"{symbol.upper()}::{timeframe.lower()}"
+    c = normalize(candle)
 
+    if history[key] and history[key][-1]["time"] == c["time"]:
+        history[key][-1] = c
+    else:
+        history[key].append(c)
+
+    return key
+
+
+def ingest(payload):
+    symbol = str(payload.get("symbol", "XAUUSD")).upper()
+    timeframe = str(payload.get("timeframe", "3m")).lower()
+
+    # One candle
+    if all(k in payload for k in ("open", "high", "low", "close")):
+        add_candle(symbol, timeframe, payload)
+
+    # Candle array
+    candles = payload.get("candles", [])
+    if isinstance(candles, list):
+        for c in candles:
+            if isinstance(c, dict) and all(
+                k in c for k in ("open", "high", "low", "close")
+            ):
+                add_candle(symbol, timeframe, c)
+
+    key = f"{symbol}::{timeframe}"
+    return symbol, timeframe, list(history[key])
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+
+@app.get("/")
+def home():
     return jsonify({
         "status": "online",
         "name": "XAU AI Trading Copilot",
-        "version": "2.0",
-        "message": "SMC + ICT market analysis engine is running"
+        "version": VERSION,
+        "modules": [
+            "SMC", "ICT", "MSNR", "Support/Resistance",
+            "S/R Pullback Retest", "Liquidity Sweep",
+            "BOS", "CHoCH", "Price Action",
+            "Premium/Discount", "FVG", "Order Block",
+            "News Filter", "Risk/TP"
+        ]
     })
 
 
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.route("/health", methods=["GET"])
+@app.get("/health")
 def health():
-
     return jsonify({
         "status": "healthy",
-        "time": datetime.utcnow().isoformat()
+        "version": VERSION,
+        "time": datetime.now(timezone.utc).isoformat()
     })
 
 
-# ============================================================
-# TRADINGVIEW WEBHOOK
-# ============================================================
+@app.get("/status")
+def status():
+    return jsonify({
+        "status": "online",
+        "version": VERSION,
+        "stored_candles": {
+            key: len(value) for key, value in history.items()
+        }
+    })
 
-@app.route("/webhook", methods=["POST"])
+
+@app.post("/reset")
+def reset():
+    history.clear()
+    return jsonify({"status": "success", "message": "History cleared"})
+
+
+@app.post("/webhook")
 def webhook():
-
     try:
+        payload = request.get_json(silent=True) or {}
 
-        data = request.get_json(silent=True)
-
-        if not data:
+        if not payload:
             return jsonify({
                 "status": "error",
-                "message": "No JSON data received"
+                "message": "JSON payload required"
             }), 400
 
-        symbol = data.get("symbol", "XAUUSD")
+        symbol, timeframe, cs = ingest(payload)
 
-        price = safe_float(
-            data.get("price", 0)
-        )
-
-        timeframe = data.get(
-            "timeframe",
-            "3m"
-        )
-
-        signal = analyse_market(
-            symbol=symbol,
-            price=price,
-            timeframe=timeframe,
-            data=data
+        result = analyse(
+            symbol,
+            timeframe,
+            cs,
+            payload
         )
 
         return jsonify({
             "status": "success",
-            "analysis": signal
+            "analysis": result
         })
 
     except Exception as e:
-
         return jsonify({
             "status": "error",
             "message": str(e)
         }), 500
 
 
-# ============================================================
-# TEST ENDPOINT
-# ============================================================
+@app.post("/analyse")
+def analyse_route():
+    return webhook()
 
-@app.route("/test", methods=["GET"])
-def test():
-
-    sample = []
-
-    price = 3400.0
-
-    for i in range(30):
-
-        open_price = price
-
-        if i % 3 == 0:
-            close_price = price + 1.5
-        else:
-            close_price = price + 0.5
-
-        high = max(open_price, close_price) + 1.0
-        low = min(open_price, close_price) - 1.0
-
-        sample.append({
-            "time": i,
-            "open": open_price,
-            "high": high,
-            "low": low,
-            "close": close_price,
-            "volume": 1000
-        })
-
-        price = close_price
-
-    result = analyse_market(
-        symbol="XAUUSD",
-        price=price,
-        timeframe="3m",
-        data={
-            "candles": sample
-        }
-    )
-
-    return jsonify(result)
-
-
-# ============================================================
-# RUN SERVER
-# ============================================================
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get("PORT", 5000)
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
